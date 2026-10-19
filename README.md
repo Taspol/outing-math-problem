@@ -1,36 +1,72 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Outing Math Flip
 
-## Getting Started
+A flip-card math game for team outings. The host draws a random problem, a timer counts down, and one tap
+shows the answer. Phones that scan the session QR code follow each problem and answer live.
 
-First, run the development server:
+- **Play** — Begin a session, scan the QR on the host's phone, then tap: draw → show answer → next card.
+  `Space` advances, `P` pauses, `F` toggles full screen.
+- **Problems** — Edit, add or delete problems. Answers are worked out automatically (+ − × ÷ and brackets).
+  **Download CSV** exports the list.
+- **Monitor** (`/monitor/<code>`) — Live problem, answer, timer and history for one session.
+
+## Run locally
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev          # http://localhost:3000 (or the next free port)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Phones on the same Wi-Fi can scan the QR code: it uses the computer's network address automatically.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Deploy
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+The app needs **one long-running Node server**: problems are saved to a CSV file and live sessions are
+kept in memory. Serverless hosts (Vercel, Netlify functions) won't keep either, so use Docker or any
+Node host with a persistent disk.
 
-## Learn More
+### Docker (recommended)
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+docker compose up -d --build    # http://<server>:3000
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The problem list lives in the `problems` volume at `/data/problems.csv` and survives rebuilds.
+The first start copies the starter list from `data/problems.csv`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Works the same on a VPS, Render, Railway or Fly.io — point them at the `Dockerfile`, expose port 3000,
+mount a persistent disk at `/data`, and run **a single instance** (sessions are held in memory).
 
-## Deploy on Vercel
+### Without Docker
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+npm ci
+npm run build
+PROBLEMS_CSV=/var/lib/outing-math/problems.csv node .next/standalone/server.js
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Copy `.next/static` to `.next/standalone/.next/static`, and `public` and `data` into `.next/standalone/`, before starting
+(the Dockerfile does this for you).
+
+### Settings
+
+| Variable         | Default              | Purpose                                                    |
+| ---------------- | -------------------- | ---------------------------------------------------------- |
+| `PROBLEMS_CSV`   | `data/problems.csv`  | Where the problem list is saved.                           |
+| `PORT`           | `3000`               | Port the server listens on.                                |
+
+There is no login: anyone with the link can host a game and edit the problem list. Session codes are
+random and expire 12 hours after the last activity.
+
+### Behind a reverse proxy
+
+Live updates use Server-Sent Events. With nginx, turn off buffering for them:
+
+```nginx
+location /api/session/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
+```
+
+Serve the site over HTTPS so browsers allow full screen and copy-to-clipboard everywhere.
