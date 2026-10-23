@@ -1,5 +1,8 @@
 import type { Problem } from "./types";
 
+/** Where a round is: waiting to start, being played, completed by the operator, or over (time ran out). */
+export type Phase = "idle" | "playing" | "complete" | "over";
+
 /** What the game broadcasts to monitors. */
 export type SessionState = {
   problem: Problem | null;
@@ -13,8 +16,10 @@ export type SessionState = {
   drawn: number;
   total: number;
   status: { title: string; sub: string };
-  history: { position: number; expr: string; answer: number }[];
+  history: { position: number; expr: string; answer: number; round?: number }[];
   ended: boolean;
+  phase: Phase;
+  round: number;
 };
 
 /** What a monitor receives: the state plus server timestamps to keep the clock in step. */
@@ -32,11 +37,13 @@ export const EMPTY_STATE: SessionState = {
   running: false,
   done: false,
   elapsed: 0,
-  duration: 20,
+  duration: 30,
   mode: "down",
   drawn: 0,
   total: 0,
-  status: { title: "Waiting", sub: "The host hasn't drawn a card yet" },
+  status: { title: "Waiting", sub: "The host hasn't started a round yet" },
   history: [],
   ended: false,
+  phase: "idle",
+  round: 0,
 };

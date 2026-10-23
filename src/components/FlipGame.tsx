@@ -3,19 +3,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fmt, pretty, tryCalc } from "@/lib/calc";
 import type { Problem } from "@/lib/types";
-import type { SessionState } from "@/lib/sessionTypes";
+import type { Phase, SessionState } from "@/lib/sessionTypes";
 import QrModal from "./QrModal";
 
-type Mode = "down" | "up";
-type Settings = { seconds: number; mode: Mode; sound: boolean };
+// A round: the clock runs once for the whole round. The operator steps through cards (answer first,
+// then the next problem) and keeps score themselves.
+type Settings = { seconds: number; sound: boolean };
 
 const RADIUS = 52;
 const CIRC = 2 * Math.PI * RADIUS;
-const SETTINGS_KEY = "omf-settings";
-const DEFAULT_SETTINGS: Settings = { seconds: 20, mode: "down", sound: true };
+const SETTINGS_KEY = "omf-round-settings";
+const DEFAULT_SETTINGS: Settings = { seconds: 30, sound: true };
 
 function clampSeconds(n: number) {
-  return Math.max(1, Math.min(600, Math.round(n) || 20));
+  return Math.max(5, Math.min(600, Math.round(n) || DEFAULT_SETTINGS.seconds));
 }
 
 export default function FlipGame({ problems, active }: { problems: Problem[]; active: boolean }) {
@@ -24,7 +25,13 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
   const [current, setCurrent] = useState<Problem | null>(null);
   const [flipped, setFlipped] = useState(false);
   const [showAnswer, setShowAnswer] = useState(false);
-  const [status, setStatus] = useState({ title: "Ready", sub: "Draw a card to start the clock" });
+  const [status, setStatus] = useState({ title: "Ready", sub: "Press Start round to begin the clock" });
+
+  // round
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [round, setRound] = useState(0);
+  const flipTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const dealing = useRef(false); // true while the next card is flipping in, so a double click can't skip a card
 
   // timer
   const [running, setRunning] = useState(false);
@@ -50,12 +57,18 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
 
   const duration = clampSeconds(settings.seconds);
   const elapsed = elapsedBefore + (running ? (now - startedAt) / 1000 : 0);
+  const playing = phase === "playing";
+  const cardsThisRound = history.filter((h) => h.round === round).length;
 
   // load / save settings
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-      setSettings({ ...DEFAULT_SETTINGS, ...saved, seconds: clampSeconds(Number(saved.seconds ?? 20)) });
+      setSettings({
+        ...DEFAULT_SETTINGS,
+        ...saved,
+        seconds: clampSeconds(Number(saved.seconds ?? DEFAULT_SETTINGS.seconds)),
+      });
     } catch {}
   }, []);
   const updateSettings = (patch: Partial<Settings>) => {
@@ -77,101 +90,141 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
     return () => clearInterval(id);
   }, [running]);
 
-  const beep = useCallback(() => {
+  useEffect(() => () => clearTimeout(flipTimer.current), []);
+
+  const timeUpSound = useCallback(() => {
     try {
       const ctx = (audioRef.current ??= new AudioContext());
-      [0, 0.25, 0.5].forEach((t, i) => {
+      [[880, 0, 0.18], [880, 0.25, 0.18], [660, 0.5, 0.5]].forEach(([freq, at, len]) => {
         const o = ctx.createOscillator();
         const g = ctx.createGain();
-        o.frequency.value = i === 2 ? 660 : 880;
+        o.frequency.value = freq;
         o.type = "square";
-        g.gain.setValueAtTime(0.12, ctx.currentTime + t);
-        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + (i === 2 ? 0.5 : 0.18));
+        g.gain.setValueAtTime(0.12, ctx.currentTime + at);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + at + len);
         o.connect(g).connect(ctx.destination);
-        o.start(ctx.currentTime + t);
-        o.stop(ctx.currentTime + t + 0.55);
+        o.start(ctx.currentTime + at);
+        o.stop(ctx.currentTime + at + len + 0.05);
       });
     } catch {}
   }, []);
 
-  // time up
+  const completeSound = useCallback(() => {
+    try {
+      const ctx = (audioRef.current ??= new AudioContext());
+      [[660, 0, 0.12], [880, 0.13, 0.12], [1175, 0.26, 0.45]].forEach(([freq, at, len]) => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.frequency.value = freq;
+        o.type = "triangle";
+        g.gain.setValueAtTime(0.18, ctx.currentTime + at);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + at + len);
+        o.connect(g).connect(ctx.destination);
+        o.start(ctx.currentTime + at);
+        o.stop(ctx.currentTime + at + len + 0.05);
+      });
+    } catch {}
+  }, []);
+
+  // time up: the round ends and the card on the table shows its answer
   useEffect(() => {
-    if (running && settings.mode === "down" && elapsed >= duration) {
+    if (running && playing && elapsed >= duration) {
+      clearTimeout(flipTimer.current);
+      dealing.current = false;
       setRunning(false);
       setElapsedBefore(duration);
       setDone(true);
-      setStatus({ title: "Time's up!", sub: "Tap to show the answer" });
-      if (settings.sound) beep();
+      setPhase("over");
+      setShowAnswer(true);
+      setFlipped(true);
+      setStatus({ title: "Time's up!", sub: "Press Next round to play again" });
+      if (settings.sound) timeUpSound();
     }
-  }, [running, elapsed, duration, settings.mode, settings.sound, beep]);
+  }, [running, playing, elapsed, duration, settings.sound, timeUpSound]);
 
-  const startTimer = () => {
+  const remaining = problems.filter((p) => !seen.has(p.no));
+
+  /** Flip to a new random card. The clock is not touched: it runs for the whole round. */
+  const dealCard = useCallback(
+    (roundNo: number) => {
+      if (!problems.length) return;
+      const pool = remaining.length ? remaining : problems;
+      const baseSeen = remaining.length ? seen : new Set<number>();
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      setSeen(new Set(baseSeen).add(pick.no));
+
+      const show = () => {
+        dealing.current = false;
+        setHistory((h) => [
+          ...h,
+          { position: problems.indexOf(pick) + 1, expr: pick.expr, answer: pick.answer, round: roundNo },
+        ]);
+        setCurrent(pick);
+        setShowAnswer(false);
+        setFlipped(true);
+      };
+
+      clearTimeout(flipTimer.current);
+      if (flipped) {
+        dealing.current = true;
+        setFlipped(false);
+        const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        flipTimer.current = setTimeout(show, reduce ? 0 : 380);
+      } else {
+        show();
+      }
+    },
+    [problems, remaining, seen, flipped],
+  );
+
+  const startRound = useCallback(() => {
+    if (!problems.length) return;
+    if (settings.sound && !audioRef.current) {
+      try { audioRef.current = new AudioContext(); } catch {}
+    }
+    const next = round + 1;
+    setRound(next);
+    setPhase("playing");
     const t = performance.now();
     setElapsedBefore(0);
     setStartedAt(t);
     setNow(t);
     setDone(false);
     setRunning(true);
-  };
+    setStatus({ title: "Go!", sub: "Click to show the answer" });
+    dealCard(next);
+  }, [problems.length, settings.sound, round, dealCard]);
 
-  const remaining = problems.filter((p) => !seen.has(p.no));
-
-  const draw = useCallback(() => {
-    if (!problems.length) return;
-    if (settings.sound && !audioRef.current) {
-      try { audioRef.current = new AudioContext(); } catch {}
-    }
-    const pool = remaining.length ? remaining : problems;
-    const baseSeen = remaining.length ? seen : new Set<number>();
-
-    const showNext = () => {
-      const pick = pool[Math.floor(Math.random() * pool.length)];
-      setSeen(new Set(baseSeen).add(pick.no));
-      setHistory((h) => [...h, { position: problems.indexOf(pick) + 1, expr: pick.expr, answer: pick.answer }]);
-      setCurrent(pick);
-      setShowAnswer(false);
-      setFlipped(true);
-      setStatus({
-        title: "Go!",
-        sub: settings.mode === "down" ? "Solve it before time runs out" : "Clock is running",
-      });
-      startTimer();
-    };
-
-    if (flipped) {
-      setFlipped(false);
-      setRunning(false);
-      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      setTimeout(showNext, reduce ? 0 : 450);
+  // During a round each click does the next step: show this card's answer, then flip to a new problem.
+  const step = useCallback(() => {
+    if (!playing || !running || !current || dealing.current) return;
+    if (!showAnswer) {
+      setShowAnswer(true);
+      setStatus({ title: "Answer", sub: "Click for the next problem" });
     } else {
-      showNext();
+      setStatus({ title: "Go!", sub: "Click to show the answer" });
+      dealCard(round);
     }
-  }, [problems, remaining, seen, flipped, settings.mode, settings.sound]);
+  }, [playing, running, current, showAnswer, dealCard, round]);
 
   const togglePause = useCallback(() => {
-    if (!current || done || showAnswer) return;
+    if (!playing) return;
     if (running) {
       setElapsedBefore(elapsed);
       setRunning(false);
-      setStatus({ title: "Paused", sub: "Press resume to continue" });
+      setStatus({ title: "Paused", sub: "Press Resume to continue" });
     } else {
       const t = performance.now();
       setStartedAt(t);
       setNow(t);
       setRunning(true);
-      setStatus({ title: "Go!", sub: "Solve it before time runs out" });
+      setStatus({ title: "Go!", sub: showAnswer ? "Click for the next problem" : "Click to show the answer" });
     }
-  }, [current, done, showAnswer, running, elapsed]);
-
-  const reveal = useCallback(() => {
-    if (!current) return;
-    setShowAnswer(true);
-    setElapsedBefore(elapsed);
-    setRunning(false);
-    setStatus({ title: "Answer", sub: `Took ${elapsed.toFixed(1)} s · tap again for the next card` });
-  }, [current, elapsed]);
+  }, [playing, running, elapsed, showAnswer]);
 
   const reset = () => {
+    clearTimeout(flipTimer.current);
+    dealing.current = false;
     setSeen(new Set());
     setRunning(false);
     setElapsedBefore(0);
@@ -180,15 +233,30 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
     setFlipped(false);
     setShowAnswer(false);
     setHistory([]);
+    setPhase("idle");
+    setRound(0);
     setStatus({ title: "Shuffled", sub: `All ${problems.length} cards are back in the deck` });
   };
 
-  // One button does both: first press shows the answer, the next press draws a new card.
-  const needsAnswer = flipped && !!current && !showAnswer;
-  const advance = useCallback(() => {
-    if (needsAnswer) reveal();
-    else draw();
-  }, [needsAnswer, reveal, draw]);
+  // The operator ends the round when the team has finished: the clock stops and the screen says so.
+  const complete = useCallback(() => {
+    if (!playing) return;
+    clearTimeout(flipTimer.current);
+    dealing.current = false;
+    const t = elapsed;
+    setElapsedBefore(t);
+    setRunning(false);
+    setPhase("complete");
+    setFlipped(true);
+    setStatus({ title: "Complete!", sub: `Finished in ${t.toFixed(1)} s · press Next round` });
+    if (settings.sound) completeSound();
+  }, [playing, elapsed, settings.sound, completeSound]);
+
+  // The main action: start a round when none is running, otherwise take the next step.
+  const primary = useCallback(() => {
+    if (playing) step();
+    else startRound();
+  }, [playing, step, startRound]);
 
   const toggleFullscreen = useCallback(async () => {
     if (!presenting) {
@@ -222,15 +290,16 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
     if (!active || !begun || qrOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).closest("input, select, textarea")) return;
-      if (e.code === "Space") { e.preventDefault(); advance(); }
-      else if (e.key.toLowerCase() === "p") togglePause();
-      else if (e.key.toLowerCase() === "f") toggleFullscreen();
+      const k = e.key.toLowerCase();
+      if (e.code === "Space" || e.key === "Enter" || e.key === "ArrowRight") { e.preventDefault(); primary(); }
+      else if (k === "c") complete();
+      else if (k === "p") togglePause();
+      else if (k === "f") toggleFullscreen();
       else if (e.key === "Escape" && presenting && !document.fullscreenElement) setPresenting(false);
-      else if (e.key.toLowerCase() === "a") reveal();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [active, begun, qrOpen, advance, togglePause, reveal, toggleFullscreen, presenting]);
+  }, [active, begun, qrOpen, primary, complete, togglePause, toggleFullscreen, presenting]);
 
   // ---- session: begin, sync to monitors, end ----
   const begin = async () => {
@@ -270,12 +339,14 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
         done,
         elapsed: elapsedBefore + (running ? (performance.now() - startedAt) / 1000 : 0),
         duration,
-        mode: settings.mode,
+        mode: "down",
         drawn: problems.length - remaining.length,
         total: problems.length,
         status,
         history,
         ended: false,
+        phase,
+        round,
         ...extra,
       };
       try {
@@ -287,10 +358,10 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
         if (res.ok) setViewers((await res.json()).viewers ?? 0);
       } catch {}
     },
-    [session, current, position, showAnswer, running, done, elapsedBefore, startedAt, duration, settings.mode, problems.length, remaining.length, status, history],
+    [session, current, position, showAnswer, running, done, elapsedBefore, startedAt, duration, problems.length, remaining.length, status, history, phase, round],
   );
 
-  // Send on every real change (draw, reveal, pause, time up…), never on the 100 ms clock tick.
+  // Send on every real change (new card, score, pause, time up…), never on the 100 ms clock tick.
   useEffect(() => {
     pushState();
   }, [pushState]);
@@ -315,27 +386,21 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
     setSession(null);
     setBegun(false);
     if (presenting) toggleFullscreen();
-    setStatus({ title: "Ready", sub: "Draw a card to start the clock" });
+    setStatus({ title: "Ready", sub: "Press Start round to begin the clock" });
   };
 
-  // ring display
-  let shown: number, frac: number, warn: boolean;
-  if (settings.mode === "down") {
-    const left = Math.max(0, duration - elapsed);
-    shown = Math.ceil(left);
-    frac = left / duration;
-    warn = left <= 5 && left > 0 && !done;
-  } else {
-    shown = Math.floor(elapsed);
-    frac = Math.min(1, elapsed / duration);
-    warn = elapsed >= duration;
-  }
+  // ring display (always counting down for the round)
+  const left = Math.max(0, duration - elapsed);
+  const shown = phase === "idle" ? duration : Math.ceil(left);
+  const frac = phase === "idle" ? 1 : left / duration;
+  const warn = playing && left <= 5 && left > 0;
 
   const answer = current ? tryCalc(current.expr) : null;
-  const pauseDisabled = !current || done || showAnswer;
 
   const btn =
     "rounded-full border-2 border-line px-[22px] py-3 font-semibold text-on-felt transition hover:bg-white/10 active:translate-y-px disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent";
+  const smallBtn =
+    "rounded-full border border-line px-4 py-1.5 text-sm font-semibold text-on-felt-soft transition hover:bg-white/10 hover:text-on-felt disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent";
   const corner = "absolute text-center font-mono text-[clamp(1rem,3.2cqw,2rem)] leading-tight text-red";
 
   // Size the problem to the card: monospace glyphs are ~0.62em wide, and long problems may wrap to two lines.
@@ -344,8 +409,12 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
   const problemSize = `min(13cqw, ${((84 * lines) / (Math.max(problemText.length, 1) * 0.62)).toFixed(2)}cqw)`;
 
   const cardSize = presenting
-    ? "max-w-[min(97vw,calc((100dvh-150px)*5/3.4))]"
-    : "max-w-[min(1000px,calc((100dvh-320px)*5/3.4))]";
+    ? "max-w-[min(97vw,calc((100dvh-200px)*5/3.4))]"
+    : "max-w-[min(1000px,calc((100dvh-330px)*5/3.4))]";
+
+  const primaryLabel = playing
+    ? showAnswer ? "Next problem" : "Show answer"
+    : phase === "idle" ? "Start round" : "Next round";
 
   return (
     <section
@@ -357,12 +426,13 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
     >
       <span hidden={presenting} className="font-mono text-sm tabular-nums text-on-felt-soft">
         {problems.length ? `${remaining.length} of ${problems.length} cards left` : "No problems yet"}
+        {round > 0 && ` · round ${round}`}
       </span>
 
       {!begun ? (
         <div className="flex aspect-[4/3] w-full max-w-[min(1000px,calc((100dvh-320px)*5/3.4))] min-w-[min(100%,320px)] flex-col items-center justify-center gap-5 rounded-[clamp(14px,2.4cqw,28px)] border-2 border-dashed border-line px-6 text-center sm:aspect-[5/3.4]">
           <p className="text-xs font-semibold tracking-[.08em] text-on-felt-soft uppercase">
-            {problems.length} cards · {duration} s per card
+            {duration} s per round · {problems.length} cards
           </p>
           <h2 className="max-w-[18ch] text-[clamp(1.8rem,5vw,3.2rem)] leading-[1.05] font-extrabold tracking-tight text-balance">
             Ready when your team is
@@ -381,17 +451,17 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
         </div>
       ) : (
         <>
-      {/* card */}
+      {/* card: clicking it does the same as the main button */}
       <div
         role="button"
         tabIndex={0}
-        aria-label={needsAnswer ? "Show the answer" : "Draw the next card"}
-        onClick={advance}
-        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); advance(); } }}
-        className={`@container aspect-[4/3] w-full ${cardSize} min-w-[min(100%,320px)] cursor-pointer perspective-[1400px] sm:aspect-[5/3.4]`}
+        aria-label={primaryLabel}
+        onClick={primary}
+        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); primary(); } }}
+        className={`@container relative aspect-[4/3] w-full ${cardSize} min-w-[min(100%,320px)] cursor-pointer perspective-[1400px] sm:aspect-[5/3.4]`}
       >
         <div
-          className={`relative h-full w-full transition-transform duration-700 ease-[cubic-bezier(.3,1.3,.5,1)] transform-3d ${
+          className={`relative h-full w-full transition-transform duration-500 ease-[cubic-bezier(.3,1.3,.5,1)] transform-3d ${
             flipped ? "rotate-y-180" : ""
           }`}
         >
@@ -402,7 +472,7 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
                 ?
               </div>
               <div className="rounded-md bg-red-deep px-[1.6cqw] py-[.6cqw] text-[clamp(.8rem,2.4cqw,1.4rem)] font-medium tracking-[.08em] uppercase">
-                Tap to draw
+                {playing ? "Next problem…" : `Tap to start · ${duration}s`}
               </div>
             </div>
           </div>
@@ -415,6 +485,11 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
                 <small className="block text-[.55em] text-muted">problem</small>
               </div>
             ))}
+            {phase === "over" && (
+              <div className="absolute top-[3.5cqw] left-1/2 -translate-x-1/2 rounded-full bg-red px-[2.4cqw] py-[.8cqw] text-[clamp(.9rem,3cqw,1.8rem)] font-extrabold tracking-wide whitespace-nowrap text-white">
+                Time&apos;s up · {cardsThisRound} {cardsThisRound === 1 ? "problem" : "problems"}
+              </div>
+            )}
             <div
               style={{ fontSize: problemSize }}
               className="max-w-full text-center font-mono leading-[1.15] font-medium tracking-tight text-balance [overflow-wrap:anywhere]"
@@ -433,86 +508,121 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
             </div>
           </div>
         </div>
-      </div>
 
-      {/* in full screen, timer and buttons share one row under the card */}
-      <div className={presenting ? "flex flex-wrap items-center justify-center gap-x-10 gap-y-3" : "contents"}>
-      {/* timer */}
-      <div className="flex items-center gap-[18px]">
-        <div className={`relative ${presenting ? "size-20 md:size-24" : "size-28 md:size-36"}`}>
-          <svg viewBox="0 0 120 120" aria-hidden="true" className="size-full -rotate-90">
-            <circle cx="60" cy="60" r={RADIUS} fill="none" strokeWidth="9" className="stroke-line" />
-            <circle
-              cx="60"
-              cy="60"
-              r={RADIUS}
-              fill="none"
-              strokeWidth="9"
-              strokeLinecap="round"
-              strokeDasharray={CIRC}
-              strokeDashoffset={CIRC * (1 - frac)}
-              className={`transition-[stroke-dashoffset,stroke] duration-300 ease-linear ${warn ? "stroke-red" : "stroke-gold"}`}
-            />
-          </svg>
+        {/* COMPLETE stamp over the whole card, so everyone in the room sees the round is done */}
+        {phase === "complete" && (
           <div
-            key={done ? "done" : "live"}
-            className={`absolute inset-0 grid place-items-center font-mono tabular-nums ${
-              presenting ? "text-[1.8rem] md:text-[2.2rem]" : "text-[2.2rem] md:text-[2.8rem]"
-            } ${
-              done ? "animate-pulse-num text-red" : ""
-            }`}
+            role="status"
+            className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-[clamp(14px,2.4cqw,28px)] bg-[#2f9e6a]/25 [transform:translateZ(2px)]"
           >
-            {shown}
+            <div className="flex animate-stamp flex-col items-center rounded-[2.4cqw] border-[0.9cqw] border-[#2f9e6a] bg-white/95 px-[5cqw] py-[2cqw] text-[#2f9e6a] shadow-[0_18px_40px_rgba(0,0,0,.25)]">
+              <span className="text-[13cqw] leading-none font-extrabold tracking-tight">COMPLETE</span>
+              <span className="mt-[1cqw] font-mono text-[4.2cqw] leading-none tabular-nums">
+                ✓ {elapsedBefore.toFixed(1)} s · {cardsThisRound} {cardsThisRound === 1 ? "problem" : "problems"}
+              </span>
+            </div>
           </div>
-        </div>
-        <div className="max-w-[16ch] text-on-felt-soft">
-          <strong className="block text-xl text-on-felt">{status.title}</strong>
-          {status.sub}
-        </div>
-      </div>
-
-      {/* controls */}
-      <div className="flex flex-wrap justify-center gap-2.5">
-        <button
-          className={`${btn} border-gold bg-gold text-[#2a2205] hover:bg-gold-hi`}
-          onClick={advance}
-          disabled={!problems.length}
-        >
-          {needsAnswer ? "Show answer" : current ? "Next card" : "Draw card"}
-        </button>
-        <button className={btn} onClick={togglePause} disabled={pauseDisabled}>
-          {running || pauseDisabled ? "Pause" : "Resume"}
-        </button>
-        <button className={btn} onClick={toggleFullscreen}>
-          {presenting ? "Exit full screen" : "Full screen"}
-        </button>
-        {!presenting && (
-          <>
-            <button className={btn} onClick={reset}>
-              Shuffle deck
-            </button>
-            <button className={btn} onClick={() => setQrOpen(true)}>
-              Show QR{viewers ? ` · ${viewers}` : ""}
-            </button>
-            <button className={`${btn} hover:border-red hover:bg-red/20`} onClick={endSession}>
-              End session
-            </button>
-          </>
         )}
       </div>
+
+      {/* one compact row right under the card: clock, main step, Complete and Pause always fit on screen */}
+      <div className="flex w-full flex-wrap items-center justify-center gap-x-8 gap-y-3">
+        <div className="flex items-center gap-3.5">
+          <div className={`relative shrink-0 ${presenting ? "size-28 md:size-36" : "size-28 md:size-32"}`}>
+            <svg viewBox="0 0 120 120" aria-hidden="true" className="size-full -rotate-90">
+              <circle cx="60" cy="60" r={RADIUS} fill="none" strokeWidth="10" className="stroke-line" />
+              <circle
+                cx="60"
+                cy="60"
+                r={RADIUS}
+                fill="none"
+                strokeWidth="10"
+                strokeLinecap="round"
+                strokeDasharray={CIRC}
+                strokeDashoffset={CIRC * (1 - frac)}
+                className={`transition-[stroke-dashoffset,stroke] duration-300 ease-linear ${warn ? "stroke-red" : "stroke-gold"}`}
+              />
+            </svg>
+            <div
+              key={done ? "done" : "live"}
+              className={`absolute inset-0 grid place-items-center font-mono leading-none font-medium tabular-nums ${
+                presenting ? "text-[2.8rem] md:text-[3.6rem]" : "text-[2.8rem] md:text-[3.2rem]"
+              } ${warn || done ? "text-red" : ""} ${done ? "animate-pulse-num" : ""}`}
+            >
+              {shown}
+            </div>
+          </div>
+          <div className="max-w-[18ch] text-sm leading-snug text-on-felt-soft">
+            {round > 0 && (
+              <span className="font-mono text-xs tabular-nums">
+                Round {round} · problem {cardsThisRound}
+              </span>
+            )}
+            <strong className="block text-lg text-on-felt">{status.title}</strong>
+            {status.sub}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap justify-center gap-2.5">
+          <button
+            className={`${btn} min-w-[10.5em] border-gold bg-gold text-[#2a2205] hover:bg-gold-hi`}
+            onClick={primary}
+            disabled={!problems.length || (playing && !running)}
+          >
+            {primaryLabel}
+          </button>
+          <button
+            className={`${btn} border-[#2f9e6a] bg-[#2f9e6a] text-white hover:bg-[#37b479] disabled:hover:bg-[#2f9e6a]`}
+            onClick={complete}
+            disabled={!playing}
+            title={playing ? "End this round as complete (C)" : "Start a round first"}
+          >
+            Complete ✓
+          </button>
+          <button className={`${btn} min-w-[6.5em]`} onClick={togglePause} disabled={!playing}>
+            {playing && !running ? "Resume" : "Pause"}
+          </button>
+          {presenting && (
+            <button className={btn} onClick={toggleFullscreen}>
+              Exit full screen
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* less-used buttons */}
+      {!presenting && (
+        <div className="flex flex-wrap justify-center gap-2">
+          {[
+            { label: "Full screen", onClick: toggleFullscreen, disabled: false },
+            { label: "Shuffle deck", onClick: reset, disabled: playing },
+            { label: `Show QR${viewers ? ` · ${viewers}` : ""}`, onClick: () => setQrOpen(true), disabled: false },
+          ].map((b) => (
+            <button key={b.label} className={smallBtn} onClick={b.onClick} disabled={b.disabled}>
+              {b.label}
+            </button>
+          ))}
+          <button className={`${smallBtn} hover:border-red hover:bg-red/20`} onClick={endSession}>
+            End session
+          </button>
+        </div>
+      )}
 
         </>
       )}
 
-      {/* settings */}
-      <div hidden={presenting} className="flex w-full flex-wrap items-center justify-center gap-x-[22px] gap-y-3.5 border-t border-line pt-[18px] text-[.95rem] text-on-felt-soft">
+      {/* settings (locked while a round is running) */}
+      <fieldset
+        hidden={presenting}
+        disabled={playing}
+        className="flex w-full min-w-0 flex-wrap items-center justify-center gap-x-[22px] gap-y-3.5 border-t border-line pt-[18px] text-[.95rem] text-on-felt-soft disabled:opacity-60"
+      >
         <label htmlFor="seconds" className="flex items-center gap-2">
-          Time (sec)
+          Time per round (sec)
           <input
             id="seconds"
             type="number"
-            min={1}
+            min={5}
             max={600}
             value={settings.seconds}
             onChange={(e) => updateSettings({ seconds: Number(e.target.value) })}
@@ -520,25 +630,13 @@ export default function FlipGame({ problems, active }: { problems: Problem[]; ac
             className="w-[5.5em] rounded-lg border border-line bg-black/20 px-2 py-1.5 font-mono text-on-felt"
           />
         </label>
-        <label htmlFor="mode" className="flex items-center gap-2">
-          Mode
-          <select
-            id="mode"
-            value={settings.mode}
-            onChange={(e) => updateSettings({ mode: e.target.value as Mode })}
-            className="rounded-lg border border-line bg-black/20 px-2 py-1.5 font-mono text-on-felt"
-          >
-            <option value="down">Count down</option>
-            <option value="up">Count up</option>
-          </select>
-        </label>
         <label htmlFor="sound" className="flex items-center gap-2">
           <input id="sound" type="checkbox" checked={settings.sound} onChange={(e) => updateSettings({ sound: e.target.checked })} />
-          Beep at time up
+          Sounds
         </label>
-      </div>
+      </fieldset>
       <p hidden={presenting} className="text-center text-xs text-on-felt-soft">
-        <Kbd>Space</Kbd> answer, then next card · <Kbd>P</Kbd> pause · <Kbd>F</Kbd> full screen
+        <Kbd>Space</Kbd> start / answer / next · <Kbd>C</Kbd> complete · <Kbd>P</Kbd> pause · <Kbd>F</Kbd> full screen
       </p>
       {qrOpen && session && (
         <QrModal

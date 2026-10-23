@@ -68,7 +68,8 @@ export default function Monitor({ id }: { id: string }) {
   const left = Math.max(0, dur - elapsed);
   const shown = st?.mode === "up" ? Math.floor(elapsed) : Math.ceil(left);
   const frac = st?.mode === "up" ? Math.min(1, elapsed / dur) : left / dur;
-  const timeUp = st?.done || (st?.mode !== "up" && st?.running && left <= 0);
+  const timeUp = st?.phase === "over" || st?.done || (st?.mode !== "up" && st?.running && left <= 0);
+  const roundCards = st ? st.history.filter((h) => h.round === st.round).length : 0;
   const warn = st?.mode === "up" ? elapsed >= dur : left <= 5 && left > 0;
 
   return (
@@ -80,6 +81,16 @@ export default function Monitor({ id }: { id: string }) {
         </div>
       ) : (
         <>
+          {st.phase === "complete" && (
+            <div className="w-full rounded-2xl bg-[#2f9e6a] px-5 py-3 text-center text-xl font-extrabold text-white">
+              Round {st.round} complete ✓ · {st.elapsed.toFixed(1)} s · {roundCards} {roundCards === 1 ? "problem" : "problems"}
+            </div>
+          )}
+          {st.phase === "over" && (
+            <div className="w-full rounded-2xl bg-red px-5 py-3 text-center text-xl font-extrabold text-white">
+              Round {st.round}: time&apos;s up · {roundCards} {roundCards === 1 ? "problem" : "problems"}
+            </div>
+          )}
           <div className="w-full rounded-[18px] bg-card p-5 text-ink shadow-[0_14px_34px_rgba(0,0,0,.3)] @container sm:p-7">
             <div className="flex items-baseline justify-between font-mono text-red">
               <span className="text-lg">#{st.position}</span>
@@ -117,6 +128,11 @@ export default function Monitor({ id }: { id: string }) {
               >
                 {shown}s
               </p>
+              {st.round > 0 && (
+                <p className="font-mono text-sm tabular-nums text-on-felt-soft">
+                  Round {st.round} · problem {roundCards}
+                </p>
+              )}
               <p className="text-on-felt-soft">
                 <strong className="text-on-felt">{timeUp ? "Time's up!" : st.status.title}</strong> · {st.status.sub}
               </p>
@@ -131,6 +147,7 @@ export default function Monitor({ id }: { id: string }) {
           <ol className="divide-y divide-line rounded-xl bg-row font-mono text-sm tabular-nums">
             {[...st.history].reverse().map((h, i) => (
               <li key={i} className="flex justify-between gap-3 px-3 py-2">
+                {h.round ? <span className="text-on-felt-soft">R{h.round}</span> : null}
                 <span className="text-on-felt-soft">#{h.position}</span>
                 <span className="min-w-0 flex-1 truncate">{pretty(h.expr)}</span>
                 <span className="text-gold">= {fmt(h.answer)}</span>
