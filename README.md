@@ -27,13 +27,13 @@ Node host with a persistent disk.
 ### Docker (recommended)
 
 ```bash
-docker compose up -d --build    # http://<server>:3000
+docker compose up -d --build    # http://<server>:3001
 ```
 
 The problem list lives in the `problems` volume at `/data/problems.csv` and survives rebuilds.
 The first start copies the starter list from `data/problems.csv`.
 
-Works the same on a VPS, Render, Railway or Fly.io — point them at the `Dockerfile`, expose port 3000,
+Works the same on a VPS, Render, Railway or Fly.io — point them at the `Dockerfile`, expose port 3001,
 mount a persistent disk at `/data`, and run **a single instance** (sessions are held in memory).
 
 ### Without Docker
@@ -52,7 +52,7 @@ Copy `.next/static` to `.next/standalone/.next/static`, and `public` and `data` 
 | Variable         | Default              | Purpose                                                    |
 | ---------------- | -------------------- | ---------------------------------------------------------- |
 | `PROBLEMS_CSV`   | `data/problems.csv`  | Where the problem list is saved.                           |
-| `PORT`           | `3000`               | Port the server listens on.                                |
+| `PORT`           | `3001` (Docker)      | Port the server listens on.                                |
 
 There is no login: anyone with the link can host a game and edit the problem list. Session codes are
 random and expire 12 hours after the last activity.
@@ -63,7 +63,7 @@ Live updates use Server-Sent Events. With nginx, turn off buffering for them:
 
 ```nginx
 location /api/session/ {
-    proxy_pass http://127.0.0.1:3000;
+    proxy_pass http://127.0.0.1:3001;
     proxy_buffering off;
     proxy_read_timeout 1h;
 }
