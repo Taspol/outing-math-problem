@@ -2,7 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import { calc, fmt, normalize, pretty, tryCalc } from "@/lib/calc";
+import { parseProblemsCsv, type ParsedCsv } from "@/lib/csv";
 import type { Problem } from "@/lib/types";
+
+type Upload = ParsedCsv & { name: string };
+
+const pillButton =
+  "cursor-pointer rounded-full border-2 border-line px-[22px] py-3 font-semibold text-on-felt transition hover:bg-white/10";
 
 async function api(url: string, method: string, body?: unknown): Promise<Problem[]> {
   const res = await fetch(url, {
@@ -23,6 +29,7 @@ export default function ProblemTable({
   onChange: (p: Problem[]) => void;
 }) {
   const [toast, setToast] = useState("");
+  const [upload, setUpload] = useState<Upload | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const flash = (t: string) => {
     setToast(t);
@@ -36,15 +43,22 @@ export default function ProblemTable({
         <p className="m-0 text-[.95rem] text-on-felt-soft">
           Type a problem with + − × ÷ and brackets. The answer is worked out for you and saved to the CSV.
         </p>
-        {/* A file download, not a page navigation, so a plain <a> is right here. */}
-        <a
-          href="/api/problems?format=csv"
-          download
-          className="rounded-full border-2 border-line px-[22px] py-3 font-semibold text-on-felt transition hover:bg-white/10"
-        >
-          Download CSV
-        </a>
+        <div className="flex gap-2">
+          <UploadButton onPick={setUpload} flash={flash} />
+          {/* A file download, not a page navigation, so a plain <a> is right here. */}
+          <a href="/api/problems?format=csv" download className={pillButton}>
+            Download CSV
+          </a>
+        </div>
       </div>
+
+      {upload && (
+        <UploadPanel
+          upload={upload}
+          hasProblems={problems.length > 0}
+          onDone={(list, msg) => { if (list) onChange(list); setUpload(null); if (msg) flash(msg); }}
+        />
+      )}
 
       <div className="w-full overflow-x-auto rounded-[14px] bg-card text-ink shadow-[0_14px_34px_rgba(0,0,0,.3)]">
         <table className="w-full border-collapse tabular-nums">
@@ -234,5 +248,107 @@ function NewRow({
         </button>
       </td>
     </tr>
+  );
+}
+
+function UploadButton({ onPick, flash }: { onPick: (u: Upload) => void; flash: (t: string) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const read = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      onPick({ name: file.name, ...parseProblemsCsv(await file.text()) });
+    } catch {
+      flash(`Couldn't read ${file.name}`);
+    }
+    if (inputRef.current) inputRef.current.value = ""; // so picking the same file again still fires
+  };
+
+  return (
+    <>
+      <button onClick={() => inputRef.current?.click()} className={pillButton}>
+        Upload CSV
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".csv,text/csv,text/plain"
+        hidden
+        onChange={(e) => read(e.target.files?.[0])}
+      />
+    </>
+  );
+}
+
+function UploadPanel({
+  upload,
+  hasProblems,
+  onDone,
+}: {
+  upload: Upload;
+  hasProblems: boolean;
+  onDone: (list: Problem[] | null, msg?: string) => void;
+}) {
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const count = upload.exprs.length;
+
+  const save = async (mode: "replace" | "append") => {
+    setBusy(true);
+    try {
+      const list = await api("/api/problems", "PUT", { exprs: upload.exprs, mode });
+      onDone(list, mode === "append" ? `Added ${count} problems from ${upload.name}` : `Loaded ${count} problems from ${upload.name}`);
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="w-full rounded-[14px] bg-card p-5 text-ink shadow-[0_14px_34px_rgba(0,0,0,.3)]">
+      <p className="m-0 font-semibold">
+        {count ? `Found ${count} problem${count === 1 ? "" : "s"} in ${upload.name}.` : `No problems found in ${upload.name}.`}
+      </p>
+      {upload.skipped.length > 0 && (
+        <details className="mt-2 text-sm text-muted">
+          <summary className="cursor-pointer">
+            Skipped {upload.skipped.length} row{upload.skipped.length === 1 ? "" : "s"} that aren&apos;t valid problems
+          </summary>
+          <ul className="mt-1 max-h-40 overflow-y-auto pl-5 font-mono">
+            {upload.skipped.map((s) => (
+              <li key={s.line}>line {s.line}: {s.text || "(empty)"}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {error && <div className="mt-2 text-sm text-red">{error}</div>}
+      <div className="mt-4 flex flex-wrap gap-2">
+        {count > 0 && (
+          <button
+            onClick={() => save("replace")}
+            disabled={busy}
+            className="rounded-full border-2 border-ink bg-ink px-3.5 py-1.5 text-sm font-semibold text-card transition hover:bg-[#333d3a] disabled:opacity-40"
+          >
+            {hasProblems ? "Replace current list" : "Load problems"}
+          </button>
+        )}
+        {count > 0 && hasProblems && (
+          <button
+            onClick={() => save("append")}
+            disabled={busy}
+            className="rounded-full border-2 border-ink px-3.5 py-1.5 text-sm font-semibold transition hover:bg-ink/5 disabled:opacity-40"
+          >
+            Add to the end
+          </button>
+        )}
+        <button
+          onClick={() => onDone(null)}
+          disabled={busy}
+          className="rounded-full border border-ink/20 px-3.5 py-1.5 text-sm font-semibold text-muted transition hover:bg-ink/5 disabled:opacity-40"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 }

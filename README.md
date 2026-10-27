@@ -6,7 +6,8 @@ shows the answer. Phones that scan the session QR code follow each problem and a
 - **Play** — Begin a session, scan the QR on the host's phone, then tap: draw → show answer → next card.
   `Space` advances, `P` pauses, `F` toggles full screen.
 - **Problems** — Edit, add or delete problems. Answers are worked out automatically (+ − × ÷ and brackets).
-  **Download CSV** exports the list.
+  **Download CSV** exports the list. **Upload CSV** loads one back (the exported layout, any sheet with a
+  `Problem` column, or one problem per line); you choose to replace the list or add to the end.
 - **Monitor** (`/monitor/<code>`) — Live problem, answer, timer and history for one session.
 
 ## Run locally

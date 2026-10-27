@@ -94,6 +94,24 @@ export function deleteProblem(no: number) {
   });
 }
 
+/** Replaces the list, or adds to the end of it, with problems from an uploaded CSV. */
+export function importProblems(exprs: string[], mode: "replace" | "append") {
+  return locked(async () => {
+    const added = exprs.map((expr, i) => {
+      try {
+        const { clean, answer } = check(expr);
+        return { no: 0, expr: clean, answer };
+      } catch (e) {
+        throw new Error(`Problem ${i + 1} (“${expr}”): ${(e as Error).message}`);
+      }
+    });
+    if (!added.length) throw new Error("The file has no problems in it.");
+    const list = mode === "append" ? [...(await readProblems()), ...added] : added;
+    if (list.length > MAX_PROBLEMS) throw new Error(`That would make ${list.length} problems. The limit is ${MAX_PROBLEMS}.`);
+    return writeProblems(list);
+  });
+}
+
 export class NotFound extends Error {
   constructor() { super("That problem no longer exists. Reload the list."); }
 }
